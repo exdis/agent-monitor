@@ -81,13 +81,14 @@ How "waiting" is detected:
     this is purely time-based and a genuinely slow tool may show as `waiting`.
     Raise `--permission-grace` to trade detection latency for fewer false
     positives.
-- **Copilot** — a `permission.requested` event (directory/file access, shell,
-  write, url, etc.) surfaces immediately as `waiting` and clears on
-  `permission.completed`. As a fallback for sessions without those events, a
-  `tool.execution_start` that hasn't `complete`d within a short grace window is
-  also treated as `waiting`; resolved on completion, turn end, or shutdown. A
-  resumed session (`session.resume` after `session.shutdown`) is revived rather
-  than left as `ended`.
+- **Copilot** — uses Copilot's **explicit, authoritative** permission events: a
+  `permission.requested` (directory/file access, shell, write, url, mcp, …)
+  surfaces immediately as `waiting` and clears on the matching
+  `permission.completed` (correlated by `requestId`). Concurrent prompts are
+  tracked independently. There is **no** time-based guessing, so a slow but
+  auto-approved tool is never misreported as waiting. A resumed session
+  (`session.resume` after `session.shutdown`) is revived rather than left
+  `ended`.
 
 ## Status API
 

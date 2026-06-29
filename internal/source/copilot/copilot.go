@@ -29,11 +29,6 @@ type Source struct {
 	stateDir     string
 	pollInterval time.Duration
 	recentWindow time.Duration
-	// approvalGrace is how long a tool may run before a still-incomplete
-	// execution is treated as "waiting for approval". Copilot's permission
-	// prompts block the tool indefinitely, while auto-approved tools complete
-	// quickly, so a short grace period separates the two.
-	approvalGrace time.Duration
 
 	mu    sync.Mutex
 	tails map[string]*tail // sessionID -> tail state
@@ -42,28 +37,36 @@ type Source struct {
 type tail struct {
 	path   string
 	offset int64
-	// pending tracks tool executions that started but haven't completed,
-	// keyed by toolCallId. Used to detect "waiting for approval".
-	pending map[string]*pendingTool
-	// waiting is true once we've emitted a wait-begin for this session.
+	// perms holds the outstanding permission requests for this session, keyed
+	// by requestId. Copilot emits an explicit `permission.requested` when the
+	// agent is blocked on the user and a matching `permission.completed` when
+	// answered, so a non-empty map is the authoritative "waiting" signal. This
+	// correctly ignores slow-but-auto-approved tools (which never request a
+	// permission) and supports multiple concurrent requests.
+	perms map[string]*permRequest
+	// waiting mirrors len(perms) > 0 at the last emit, so we only emit
+	// wait-begin/end transitions (and refresh the prompt) when it changes.
 	waiting bool
 	ended   bool
+	// titled is set once we've resolved a human-readable title from
+	// workspace.yaml. Until then, scans keep retrying, because the file may not
+	// exist (or may be unnamed) at the moment the session first appears.
+	titled bool
 }
 
-type pendingTool struct {
-	tool    string
-	summary string
-	started time.Time
+// permRequest is one outstanding permission prompt awaiting the user.
+type permRequest struct {
+	wait model.Wait
+	at   time.Time // ordering, so the newest request drives the shown prompt
 }
 
 // New constructs a Copilot source.
 func New(stateDir string, pollInterval, recentWindow time.Duration) *Source {
 	return &Source{
-		stateDir:      stateDir,
-		pollInterval:  pollInterval,
-		recentWindow:  recentWindow,
-		approvalGrace: 4 * time.Second,
-		tails:         make(map[string]*tail),
+		stateDir:     stateDir,
+		pollInterval: pollInterval,
+		recentWindow: recentWindow,
+		tails:        make(map[string]*tail),
 	}
 }
 
@@ -99,8 +102,6 @@ func (s *Source) Run(ctx context.Context, out chan<- model.Event) error {
 			// Periodic full scan catches new sessions and is the fallback when
 			// fsnotify is unavailable.
 			s.scan(ctx, out, false)
-			// Promote long-dangling tool executions to "waiting for approval".
-			s.checkApproval(out)
 			if watcher != nil {
 				s.rewatch(watcher)
 			}
@@ -160,10 +161,20 @@ func (s *Source) scan(ctx context.Context, out chan<- model.Event, seed bool) {
 			continue
 		}
 		s.mu.Lock()
-		_, known := s.tails[id]
+		t, known := s.tails[id]
 		s.mu.Unlock()
 		if known {
-			// Already tailing; tail reads handle updates.
+			// Already tailing; tail reads handle updates. Retry workspace
+			// metadata until we get a title — workspace.yaml may have been
+			// absent or unnamed when the session first appeared.
+			if t != nil && !t.titled {
+				if meta := s.loadWorkspace(id); meta != nil && meta.Title != "" {
+					emit(out, model.Event{Kind: model.EventUpsert, Source: model.SourceCopilot, ID: id, Session: meta, At: meta.UpdatedAt})
+					s.mu.Lock()
+					t.titled = true
+					s.mu.Unlock()
+				}
+			}
 			s.readTail(id, evPath, out)
 			continue
 		}
@@ -172,11 +183,13 @@ func (s *Source) scan(ctx context.Context, out chan<- model.Event, seed bool) {
 		}
 
 		// New, recent session. Emit workspace metadata first.
+		titled := false
 		if meta := s.loadWorkspace(id); meta != nil {
 			emit(out, model.Event{Kind: model.EventUpsert, Source: model.SourceCopilot, ID: id, Session: meta, At: meta.UpdatedAt})
+			titled = meta.Title != ""
 		}
 		s.mu.Lock()
-		s.tails[id] = &tail{path: evPath, offset: 0}
+		s.tails[id] = &tail{path: evPath, offset: 0, titled: titled}
 		s.mu.Unlock()
 		// Read from the beginning so we capture the current action; the
 		// recent-window filter already bounds how much history this is.
@@ -257,12 +270,17 @@ func (s *Source) handleLine(id string, line []byte, out chan<- model.Event) {
 		// Resuming clears any prior terminal state so the session reappears as
 		// live, and drops stale in-flight tracking from before the shutdown.
 		s.mu.Lock()
+		var wasWaiting bool
 		if t := s.tails[id]; t != nil {
 			t.ended = false
-			t.pending = nil
+			t.perms = nil
+			wasWaiting = t.waiting
 			t.waiting = false
 		}
 		s.mu.Unlock()
+		if wasWaiting {
+			emit(out, model.Event{Kind: model.EventWaitEnd, Source: model.SourceCopilot, ID: id, At: at})
+		}
 		emit(out, model.Event{Kind: model.EventResume, Source: model.SourceCopilot, ID: id, At: at})
 		sess := &model.Session{ID: id, Source: model.SourceCopilot, Directory: d.Context.Cwd, Branch: d.Context.Branch}
 		emit(out, model.Event{Kind: model.EventUpsert, Source: model.SourceCopilot, ID: id, Session: sess, At: at})
@@ -310,76 +328,44 @@ func (s *Source) handleLine(id string, line []byte, out chan<- model.Event) {
 		}
 		_ = json.Unmarshal(ev.Data, &d)
 		summary := summarizeInput(d.Arguments)
-		// Track this execution as in-flight; if it doesn't complete within the
-		// approval grace period we treat the session as waiting for approval.
-		s.mu.Lock()
-		if t := s.tails[id]; t != nil {
-			if t.pending == nil {
-				t.pending = make(map[string]*pendingTool)
-			}
-			t.pending[d.ToolCallID] = &pendingTool{tool: d.ToolName, summary: summary, started: at}
-		}
-		s.mu.Unlock()
+		// A tool starting is just activity. Whether it blocks on the user is
+		// signalled separately and authoritatively by `permission.requested`;
+		// we deliberately do NOT infer waiting from execution duration, because
+		// a slow but auto-approved tool is byte-identical to a blocked one
+		// until a permission event arrives.
 		emit(out, model.Event{Kind: model.EventActivity, Source: model.SourceCopilot, ID: id, At: at,
 			Item: &model.Activity{Kind: model.ActivityTool, Tool: d.ToolName, Text: summary, At: at}})
 
 	case "tool.execution_complete":
-		var d struct {
-			ToolCallID string `json:"toolCallId"`
-			Success    bool   `json:"success"`
-		}
-		_ = json.Unmarshal(ev.Data, &d)
-		// Execution finished => no longer waiting on it. If it was the one that
-		// put us into a waiting state, clear waiting.
-		s.mu.Lock()
-		var clearWait bool
-		if t := s.tails[id]; t != nil {
-			delete(t.pending, d.ToolCallID)
-			if t.waiting && len(t.pending) == 0 {
-				t.waiting = false
-				clearWait = true
-			}
-		}
-		s.mu.Unlock()
-		if clearWait {
-			emit(out, model.Event{Kind: model.EventWaitEnd, Source: model.SourceCopilot, ID: id, At: at})
-		}
+		// Nothing to do for waiting state: permission.completed (not tool
+		// completion) is what resolves an approval prompt. Emitting no activity
+		// here avoids duplicate timeline entries for every tool.
 
 	case "permission.requested":
-		// Explicit, immediate signal the agent is blocked on the user
-		// (directory/file read, shell command, write, url, mcp, …). No grace
-		// needed: this is authoritative, unlike the execution-time heuristic.
-		s.mu.Lock()
-		if t := s.tails[id]; t != nil {
-			t.waiting = true
-		}
-		s.mu.Unlock()
-		emit(out, model.Event{Kind: model.EventWaitBegin, Source: model.SourceCopilot, ID: id, At: at, Wait: parsePermission(ev.Data, at)})
+		// Explicit, authoritative signal that the agent is blocked on the user
+		// (directory/file read, shell command, write, url, mcp, …). Keyed by
+		// requestId so concurrent prompts are tracked independently.
+		reqID := permRequestID(ev.Data)
+		w := parsePermission(ev.Data, at)
+		s.recordPermission(id, reqID, &permRequest{wait: *w, at: at}, out)
 
 	case "permission.completed":
-		// The user answered (approved/denied) => no longer blocked.
-		s.mu.Lock()
-		var clearWait bool
-		if t := s.tails[id]; t != nil && t.waiting {
-			t.waiting = false
-			clearWait = true
-		}
-		s.mu.Unlock()
-		if clearWait {
-			emit(out, model.Event{Kind: model.EventWaitEnd, Source: model.SourceCopilot, ID: id, At: at})
-		}
+		// The user answered (approved/denied/rejected) => this request resolves.
+		reqID := permRequestID(ev.Data)
+		s.resolvePermission(id, reqID, out)
 
 	case "assistant.turn_end":
-		// Turn ended; any in-flight tool tracking is no longer meaningful.
-		s.clearPending(id, at, out)
+		// A turn cannot end while a permission is pending, so a turn boundary
+		// is a safe point to clear any lingering wait (defensive).
+		s.clearPermissions(id, at, out)
 
 	case "abort", "session.error":
-		s.clearPending(id, at, out)
+		s.clearPermissions(id, at, out)
 		emit(out, model.Event{Kind: model.EventActivity, Source: model.SourceCopilot, ID: id, At: at,
 			Item: &model.Activity{Kind: model.ActivityError, Text: ev.Type, At: at}})
 
 	case "session.shutdown":
-		s.clearPending(id, at, out)
+		s.clearPermissions(id, at, out)
 		s.mu.Lock()
 		if t := s.tails[id]; t != nil {
 			t.ended = true
@@ -389,13 +375,69 @@ func (s *Source) handleLine(id string, line []byte, out chan<- model.Event) {
 	}
 }
 
-// clearPending drops all in-flight tool tracking for a session and clears any
-// active waiting state.
-func (s *Source) clearPending(id string, at time.Time, out chan<- model.Event) {
+// recordPermission registers an outstanding permission request and emits a
+// wait-begin carrying the newest prompt. Idempotent on requestId so replays
+// don't double-count.
+func (s *Source) recordPermission(id, reqID string, pr *permRequest, out chan<- model.Event) {
+	s.mu.Lock()
+	t := s.tails[id]
+	if t == nil {
+		s.mu.Unlock()
+		return
+	}
+	if t.perms == nil {
+		t.perms = make(map[string]*permRequest)
+	}
+	if _, dup := t.perms[reqID]; dup {
+		s.mu.Unlock()
+		return
+	}
+	t.perms[reqID] = pr
+	t.waiting = true
+	w := currentWaitLocked(t)
+	s.mu.Unlock()
+	emit(out, model.Event{Kind: model.EventWaitBegin, Source: model.SourceCopilot, ID: id, At: pr.at, Wait: w})
+}
+
+// resolvePermission clears one answered request. If others remain, the wait
+// continues with the next-newest prompt; otherwise the wait ends.
+func (s *Source) resolvePermission(id, reqID string, out chan<- model.Event) {
+	s.mu.Lock()
+	t := s.tails[id]
+	if t == nil || len(t.perms) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	if reqID != "" {
+		delete(t.perms, reqID)
+	} else {
+		// No correlation id: clear the oldest outstanding request.
+		var oldestKey string
+		var oldestAt time.Time
+		for k, p := range t.perms {
+			if oldestKey == "" || p.at.Before(oldestAt) {
+				oldestKey, oldestAt = k, p.at
+			}
+		}
+		delete(t.perms, oldestKey)
+	}
+	if len(t.perms) > 0 {
+		w := currentWaitLocked(t)
+		s.mu.Unlock()
+		emit(out, model.Event{Kind: model.EventWaitBegin, Source: model.SourceCopilot, ID: id, At: time.Now(), Wait: w})
+		return
+	}
+	t.waiting = false
+	s.mu.Unlock()
+	emit(out, model.Event{Kind: model.EventWaitEnd, Source: model.SourceCopilot, ID: id, At: time.Now()})
+}
+
+// clearPermissions drops all outstanding requests and ends any active wait.
+func (s *Source) clearPermissions(id string, at time.Time, out chan<- model.Event) {
 	s.mu.Lock()
 	var clearWait bool
 	if t := s.tails[id]; t != nil {
-		t.pending = nil
+		t.perms = nil
 		if t.waiting {
 			t.waiting = false
 			clearWait = true
@@ -407,53 +449,20 @@ func (s *Source) clearPending(id string, at time.Time, out chan<- model.Event) {
 	}
 }
 
-// checkApproval promotes any tool that has been in-flight longer than the
-// approval grace period into a "waiting for approval" state. Called each poll.
-func (s *Source) checkApproval(out chan<- model.Event) {
-	now := time.Now()
-	type beginEv struct {
-		id   string
-		wait model.Wait
-	}
-	var begins []beginEv
-	s.mu.Lock()
-	for id, t := range s.tails {
-		if t.waiting || t.ended || len(t.pending) == 0 {
-			continue
-		}
-		// Find the oldest in-flight tool past the grace period.
-		var oldest *pendingTool
-		for _, pt := range t.pending {
-			elapsed := now.Sub(pt.started)
-			if elapsed < s.approvalGrace {
-				continue
-			}
-			// Ignore ancient dangling starts (e.g. replayed from an old log on
-			// first scan, or a long-dead session): a real approval prompt is
-			// recent. recentWindow bounds how fresh it must be.
-			if elapsed > s.recentWindow {
-				continue
-			}
-			if oldest == nil || pt.started.Before(oldest.started) {
-				oldest = pt
-			}
-		}
-		if oldest != nil {
-			t.waiting = true
-			prompt := "approve " + oldest.tool
-			if oldest.summary != "" {
-				prompt += ": " + oldest.summary
-			}
-			begins = append(begins, beginEv{id: id, wait: model.Wait{
-				Kind: model.WaitApproval, Prompt: firstLine(prompt, 240), Tool: oldest.tool, Since: oldest.started,
-			}})
+// currentWaitLocked returns the wait describing the newest outstanding request.
+// Caller must hold s.mu.
+func currentWaitLocked(t *tail) *model.Wait {
+	var newest *permRequest
+	for _, p := range t.perms {
+		if newest == nil || p.at.After(newest.at) {
+			newest = p
 		}
 	}
-	s.mu.Unlock()
-	for _, b := range begins {
-		w := b.wait
-		emit(out, model.Event{Kind: model.EventWaitBegin, Source: model.SourceCopilot, ID: b.id, At: time.Now(), Wait: &w})
+	if newest == nil {
+		return nil
 	}
+	w := newest.wait
+	return &w
 }
 
 // workspaceYAML mirrors copilot's workspace.yaml.
@@ -527,6 +536,29 @@ func firstLine(s string, max int) string {
 		s = string([]rune(s)[:max]) + "…"
 	}
 	return s
+}
+
+// permRequestID extracts the correlation id shared by permission.requested and
+// permission.completed. Copilot puts `requestId` on both; we fall back to the
+// toolCallId (also present on both) if requestId is missing.
+func permRequestID(raw json.RawMessage) string {
+	var d struct {
+		RequestID         string `json:"requestId"`
+		ToolCallID        string `json:"toolCallId"`
+		PermissionRequest struct {
+			ToolCallID string `json:"toolCallId"`
+		} `json:"permissionRequest"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return ""
+	}
+	if d.RequestID != "" {
+		return d.RequestID
+	}
+	if d.ToolCallID != "" {
+		return d.ToolCallID
+	}
+	return d.PermissionRequest.ToolCallID
 }
 
 // parsePermission extracts a human-readable prompt and tool label from a
