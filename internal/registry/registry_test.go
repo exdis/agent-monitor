@@ -190,6 +190,21 @@ func TestWaitingNotPruned(t *testing.T) {
 	}
 }
 
+func TestResumeRevivesEnded(t *testing.T) {
+	r := New(testConfig())
+	now := time.Now()
+	r.apply(upsert("s1", model.SourceCopilot, now))
+	r.apply(model.Event{Kind: model.EventEnded, Source: model.SourceCopilot, ID: "s1", At: now})
+	if find(r, "copilot:s1").State != model.StateEnded {
+		t.Fatal("expected ended")
+	}
+	// A resume must lift the terminal state; fresh heartbeat => active again.
+	r.apply(model.Event{Kind: model.EventResume, Source: model.SourceCopilot, ID: "s1", At: time.Now()})
+	if got := find(r, "copilot:s1").State; got != model.StateActive {
+		t.Fatalf("state = %q, want active after resume", got)
+	}
+}
+
 func TestEndedClearsWaiting(t *testing.T) {
 	r := New(testConfig())
 	now := time.Now()

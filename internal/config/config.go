@@ -68,24 +68,41 @@ func (c Config) HasSource(name string) bool {
 
 // ---- discovery helpers ----
 
+// openCodeDBNames lists the candidate filenames for opencode's live SQLite
+// database. Different opencode versions/installs use different names, so we try
+// each. The first is the conventional fallback when none exist yet.
+var openCodeDBNames = []string{"opencode-stable.db", "opencode.db"}
+
 // OpenCodeDBPath resolves the path to opencode's live SQLite database,
-// honoring the override, then OPENCODE_DATA, XDG, and OS conventions.
+// honoring the override, then OPENCODE_DATA, XDG, and OS conventions. When
+// multiple candidates exist, the most recently modified is preferred so a stale
+// DB never shadows the one in active use.
 func OpenCodeDBPath(override string) string {
 	if override != "" {
 		return override
 	}
-	const dbName = "opencode-stable.db"
+	var best string
+	var bestMod time.Time
 	for _, dir := range openCodeDataDirs() {
-		p := filepath.Join(dir, dbName)
-		if fileExists(p) {
-			return p
+		for _, name := range openCodeDBNames {
+			p := filepath.Join(dir, name)
+			st, err := os.Stat(p)
+			if err != nil || st.IsDir() {
+				continue
+			}
+			if best == "" || st.ModTime().After(bestMod) {
+				best, bestMod = p, st.ModTime()
+			}
 		}
+	}
+	if best != "" {
+		return best
 	}
 	// Fall back to the most likely path even if not present yet.
 	if dirs := openCodeDataDirs(); len(dirs) > 0 {
-		return filepath.Join(dirs[0], dbName)
+		return filepath.Join(dirs[0], openCodeDBNames[0])
 	}
-	return dbName
+	return openCodeDBNames[0]
 }
 
 func openCodeDataDirs() []string {
@@ -124,9 +141,4 @@ func CopilotStateDir(override string) string {
 		base = filepath.Join(home, ".copilot")
 	}
 	return filepath.Join(base, "session-state")
-}
-
-func fileExists(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && !st.IsDir()
 }

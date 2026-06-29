@@ -146,6 +146,9 @@ const (
 	EventActivity EventKind = "activity"
 	// EventEnded marks a session terminal.
 	EventEnded EventKind = "ended"
+	// EventResume revives a previously-ended session (e.g. opencode/copilot
+	// resumed it). It clears the terminal state so subsequent events flow.
+	EventResume EventKind = "resume"
 	// EventWaitBegin marks a session as blocked on the user (Wait is set).
 	EventWaitBegin EventKind = "wait_begin"
 	// EventWaitEnd clears a session's waiting state (resolved/answered).

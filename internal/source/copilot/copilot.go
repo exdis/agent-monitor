@@ -254,6 +254,16 @@ func (s *Source) handleLine(id string, line []byte, out chan<- model.Event) {
 			} `json:"context"`
 		}
 		_ = json.Unmarshal(ev.Data, &d)
+		// Resuming clears any prior terminal state so the session reappears as
+		// live, and drops stale in-flight tracking from before the shutdown.
+		s.mu.Lock()
+		if t := s.tails[id]; t != nil {
+			t.ended = false
+			t.pending = nil
+			t.waiting = false
+		}
+		s.mu.Unlock()
+		emit(out, model.Event{Kind: model.EventResume, Source: model.SourceCopilot, ID: id, At: at})
 		sess := &model.Session{ID: id, Source: model.SourceCopilot, Directory: d.Context.Cwd, Branch: d.Context.Branch}
 		emit(out, model.Event{Kind: model.EventUpsert, Source: model.SourceCopilot, ID: id, Session: sess, At: at})
 
@@ -329,6 +339,30 @@ func (s *Source) handleLine(id string, line []byte, out chan<- model.Event) {
 				t.waiting = false
 				clearWait = true
 			}
+		}
+		s.mu.Unlock()
+		if clearWait {
+			emit(out, model.Event{Kind: model.EventWaitEnd, Source: model.SourceCopilot, ID: id, At: at})
+		}
+
+	case "permission.requested":
+		// Explicit, immediate signal the agent is blocked on the user
+		// (directory/file read, shell command, write, url, mcp, …). No grace
+		// needed: this is authoritative, unlike the execution-time heuristic.
+		s.mu.Lock()
+		if t := s.tails[id]; t != nil {
+			t.waiting = true
+		}
+		s.mu.Unlock()
+		emit(out, model.Event{Kind: model.EventWaitBegin, Source: model.SourceCopilot, ID: id, At: at, Wait: parsePermission(ev.Data, at)})
+
+	case "permission.completed":
+		// The user answered (approved/denied) => no longer blocked.
+		s.mu.Lock()
+		var clearWait bool
+		if t := s.tails[id]; t != nil && t.waiting {
+			t.waiting = false
+			clearWait = true
 		}
 		s.mu.Unlock()
 		if clearWait {
@@ -428,6 +462,7 @@ type workspaceYAML struct {
 	Cwd       string `yaml:"cwd"`
 	GitRoot   string `yaml:"git_root"`
 	Branch    string `yaml:"branch"`
+	Name      string `yaml:"name"`
 	Summary   string `yaml:"summary"`
 	CreatedAt string `yaml:"created_at"`
 	UpdatedAt string `yaml:"updated_at"`
@@ -443,10 +478,19 @@ func (s *Source) loadWorkspace(id string) *model.Session {
 	if err := yaml.Unmarshal(b, &w); err != nil {
 		return nil
 	}
+	// Prefer the human-given session name; fall back to a generated summary,
+	// then the working directory's name so the list never shows a bare UUID.
+	title := w.Name
+	if title == "" {
+		title = w.Summary
+	}
+	if title == "" && w.Cwd != "" {
+		title = filepath.Base(w.Cwd)
+	}
 	return &model.Session{
 		ID:        id,
 		Source:    model.SourceCopilot,
-		Title:     firstLine(w.Summary, 120),
+		Title:     firstLine(title, 120),
 		Directory: w.Cwd,
 		Branch:    w.Branch,
 		CreatedAt: parseTime(w.CreatedAt),
@@ -483,6 +527,52 @@ func firstLine(s string, max int) string {
 		s = string([]rune(s)[:max]) + "…"
 	}
 	return s
+}
+
+// parsePermission extracts a human-readable prompt and tool label from a
+// copilot permission.requested event. The request kind (shell/read/write/url/
+// mcp/memory) determines the most relevant detail field.
+func parsePermission(raw json.RawMessage, at time.Time) *model.Wait {
+	w := &model.Wait{Kind: model.WaitApproval, Since: at, Prompt: "needs your approval"}
+	var d struct {
+		PermissionRequest struct {
+			Kind            string `json:"kind"`
+			Intention       string `json:"intention"`
+			FullCommandText string `json:"fullCommandText"`
+			Path            string `json:"path"`
+			FileName        string `json:"fileName"`
+			URL             string `json:"url"`
+			ToolName        string `json:"toolName"`
+		} `json:"permissionRequest"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return w
+	}
+	pr := d.PermissionRequest
+	w.Tool = pr.Kind
+	// Prefer the agent's stated intention; fall back to the kind-specific
+	// detail (command, path, url, …) when no intention is present.
+	detail := pr.Intention
+	if detail == "" {
+		switch {
+		case pr.FullCommandText != "":
+			detail = pr.FullCommandText
+		case pr.Path != "":
+			detail = pr.Path
+		case pr.FileName != "":
+			detail = pr.FileName
+		case pr.URL != "":
+			detail = pr.URL
+		case pr.ToolName != "":
+			detail = pr.ToolName
+		}
+	}
+	prompt := "approve " + pr.Kind
+	if detail != "" {
+		prompt += ": " + detail
+	}
+	w.Prompt = firstLine(prompt, 240)
+	return w
 }
 
 func summarizeInput(raw json.RawMessage) string {

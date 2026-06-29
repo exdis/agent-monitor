@@ -133,6 +133,12 @@ func (r *Registry) apply(ev model.Event) bool {
 		s.State = model.StateEnded
 		s.CurrentAction = ""
 		s.Waiting = nil
+	case model.EventResume:
+		// A resumed session is no longer terminal; let the heartbeat reclassify
+		// it (computeState below will derive active/idle from LastEventAt).
+		if s.State == model.StateEnded {
+			s.State = ""
+		}
 	}
 
 	if !ev.At.IsZero() && ev.At.After(s.LastEventAt) {

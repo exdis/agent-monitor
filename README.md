@@ -81,10 +81,13 @@ How "waiting" is detected:
     this is purely time-based and a genuinely slow tool may show as `waiting`.
     Raise `--permission-grace` to trade detection latency for fewer false
     positives.
-- **Copilot** — a `tool.execution_start` that hasn't `complete`d within a short
-  grace window (Copilot's permission prompts block the tool until you approve);
-  resolved on completion, turn end, or shutdown. This is a heuristic, so a
-  genuinely long-running tool may briefly appear as `waiting`.
+- **Copilot** — a `permission.requested` event (directory/file access, shell,
+  write, url, etc.) surfaces immediately as `waiting` and clears on
+  `permission.completed`. As a fallback for sessions without those events, a
+  `tool.execution_start` that hasn't `complete`d within a short grace window is
+  also treated as `waiting`; resolved on completion, turn end, or shutdown. A
+  resumed session (`session.resume` after `session.shutdown`) is revived rather
+  than left as `ended`.
 
 ## Status API
 
@@ -188,7 +191,7 @@ All options are CLI flags (run `--help` for the full list):
 
 - **OpenCode DB**: `$OPENCODE_DATA`, then `$XDG_DATA_HOME/opencode`, then
   `~/.local/share/opencode` (and macOS `~/Library/Application Support/opencode`),
-  file `opencode-stable.db`.
+  file `opencode-stable.db` or `opencode.db` (most-recently-modified wins).
 - **Copilot state**: `$COPILOT_CONFIG_DIR/session-state`, else
   `~/.copilot/session-state`.
 
